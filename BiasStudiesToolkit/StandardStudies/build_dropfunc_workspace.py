@@ -75,7 +75,7 @@ def find_multipdf_names(w, cat_token):
     it = w.allPdfs().createIterator()
     obj = it.Next()
     while obj:
-        if obj.ClassName() == "RooMultiPdf" and cat_token in obj.GetName().lower():
+        if obj.ClassName() == "RooMultiPdf" and cat_token.lower() in obj.GetName().lower():
             names.append(obj.GetName())
         obj = it.Next()
     return names

@@ -94,13 +94,22 @@ show_help() {
     echo "  --truth-funcs <list>   Comma-separated subset of truth functions to run (default: all 7) -- use this to"
     echo "                         resume a run and only fill in combinations missing from a previous pass"
     echo "  --r-values <list>      Comma-separated subset of r_truth values to run (default: 0,2)"
+    echo "  --r-expected <X>       Per-injection POI window: each (truth, r_inj) combination is generated + fit with"
+    echo "                         --rMin r_inj-X --rMax r_inj+X instead of the global --rmin/--rmax (which are then"
+    echo "                         ignored). Also changes the default --r-values to 0,X. Typically X = the expected"
+    echo "                         upper limit on r. The window is also passed to the plotting script's boundary cut."
+    echo "  --fixed-pull <P>       Also report median_pull_fixed in pull_summary.json: bad toys counted at a fixed pull"
+    echo "                         instead of dropped, like submitBiasTests.py --failedFitR -P --keepEdgeFits P"
+    echo "                         --keepLopsidedFits P --clipOutlierPulls (failed = -P, at/near rMin = -P, at/near"
+    echo "                         rMax = +P, |pull|>=5 = +-P). Median only; histogram and Gaussian fit unchanged."
+    echo "                         Plots go to bias_plots_dropfunc_<cat>..._fixedPull<P>/ (fit outputs are shared)."
     exit 0
 }
 
 WS=""; DATACARD=""; CAT=""; LEG="hgg"; DO_RUN=false; PARALLEL=false; PUBLISH=false
 NTOYS=1000; SEED=123456; RMIN=-5; RMAX=5; STABILITY=false
 BESTFIT_WS=""; BESTFIT_CACHE=""
-TRUTH_FUNCS_ARG=""; R_VALUES_ARG=""
+TRUTH_FUNCS_ARG=""; R_VALUES_ARG=""; R_EXPECTED=""; FIXED_PULL=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -121,6 +130,8 @@ while [[ $# -gt 0 ]]; do
         --bestfit-cache) BESTFIT_CACHE="$2"; shift 2 ;;
         --truth-funcs) TRUTH_FUNCS_ARG="$2"; shift 2 ;;
         --r-values) R_VALUES_ARG="$2"; shift 2 ;;
+        --r-expected) R_EXPECTED="$2"; shift 2 ;;
+        --fixed-pull) FIXED_PULL="$2"; shift 2 ;;
         *) echo "[ERROR] Unknown option: $1"; show_help ;;
     esac
 done
@@ -138,10 +149,45 @@ if [ -n "$TRUTH_FUNCS_ARG" ]; then
 else
     TRUTH_FUNCTIONS=("exp1" "bern1" "bern2" "bern3" "pow1" "lau1" "lau2")
 fi
+if [ -n "$FIXED_PULL" ]; then
+    awk -v x="$FIXED_PULL" 'BEGIN{exit !(x+0 > 0)}' || { echo "[ERROR] --fixed-pull must be a positive number, got '$FIXED_PULL'"; exit 1; }
+fi
+if [ -n "$R_EXPECTED" ]; then
+    awk -v x="$R_EXPECTED" 'BEGIN{exit !(x+0 > 0)}' || { echo "[ERROR] --r-expected must be a positive number, got '$R_EXPECTED'"; exit 1; }
+fi
 if [ -n "$R_VALUES_ARG" ]; then
     IFS=',' read -r -a R_TRUTH_VALUES <<< "$R_VALUES_ARG"
+elif [ -n "$R_EXPECTED" ]; then
+    R_TRUTH_VALUES=(0 "$R_EXPECTED")
 else
     R_TRUTH_VALUES=(0 2)
+fi
+
+# POI window for one injected r: [r_inj - R_EXPECTED, r_inj + R_EXPECTED] when
+# --r-expected is given, else the global --rmin/--rmax. Prints "<rmin> <rmax>".
+r_window() {
+    if [ -n "$R_EXPECTED" ]; then
+        awk -v r="$1" -v x="$R_EXPECTED" 'BEGIN{printf "%g %g\n", r - x, r + x}'
+    else
+        echo "$RMIN $RMAX"
+    fi
+}
+# With --r-expected the window is also passed to the plotting script's
+# boundary-pinned-toy cut (a narrower window makes pinned toys more common).
+# Without it, nothing is passed, so default behaviour is unchanged.
+plot_range_args() {
+    [ -z "$R_EXPECTED" ] && [ -z "$FIXED_PULL" ] && return 0
+    local lo hi; read -r lo hi <<< "$(r_window "$1")"
+    echo " --r-min $lo --r-max $hi${FIXED_PULL:+ --fixed-pull $FIXED_PULL}"
+}
+# Tags so --r-expected runs never share output files / pull_summary.json
+# with fixed-range runs (or with runs using a different --r-expected).
+if [ -n "$R_EXPECTED" ]; then
+    RANGE_TAG="rInjPm${R_EXPECTED}"
+    NAME_TAG="_${RANGE_TAG}"
+else
+    RANGE_TAG="rMin${RMIN}rMax${RMAX}"
+    NAME_TAG=""
 fi
 
 DATACARD_DIR="$(cd "$(dirname "$DATACARD")" && pwd)"
@@ -158,7 +204,7 @@ SRC_REL=$(echo "$SHAPES_LINE" | awk '{print $4}')
 TOP_PDF_TOKEN=$(echo "$SHAPES_LINE" | awk '{print $5}')
 TOP_PDF_NAME="${TOP_PDF_TOKEN#*:}"
 [ -z "$TOP_PDF_NAME" ] && { echo "[ERROR] Could not parse top-level pdf name out of: $SHAPES_LINE"; exit 1; }
-SRC_ABS="$DATACARD_DIR/$SRC_REL"
+if [[ "$SRC_REL" = /* ]]; then SRC_ABS="$SRC_REL"; else SRC_ABS="$DATACARD_DIR/$SRC_REL"; fi
 [ ! -f "$SRC_ABS" ] && { echo "[ERROR] $CAT's bkg_mass source file not found: $SRC_ABS"; exit 1; }
 SRC_BASENAME="$(basename "$SRC_REL" .root)"
 
@@ -236,13 +282,13 @@ fi
 
 LEG_TAG=""
 [ "$LEG" = "hbb" ] && LEG_TAG="_hbbleg"
-OUTDIR="./bias_plots_dropfunc_${CAT}${LEG_TAG}"
+OUTDIR="./bias_plots_dropfunc_${CAT}${LEG_TAG}${NAME_TAG}${FIXED_PULL:+_fixedPull${FIXED_PULL}}"
 
 # --- Incremental publish target: set up once up front (not just at the end)
 #     so run_one() can copy each combination's plot to public_html as soon
 #     as it's ready, instead of waiting for the whole category to finish. ---
 if [ "$PUBLISH" = true ]; then
-    PUB_DIR="$HOME/public_html/BiasSensitivityStudies_v7_final_dropfunc_${CAT}${LEG_TAG}_rMin${RMIN}rMax${RMAX}_${NTOYS}toys"
+    PUB_DIR="$HOME/public_html/BiasSensitivityStudies_v7_final_dropfunc_${CAT}${LEG_TAG}_${RANGE_TAG}_${NTOYS}toys"
     mkdir -p "$PUB_DIR/StandardStudies_dropfunc"
     TEMPLATE_INDEX=$(find "$HOME/public_html" -maxdepth 3 -iname "index.php" 2>/dev/null | head -1)
     if [ -n "$TEMPLATE_INDEX" ]; then
@@ -285,13 +331,14 @@ done
 
 run_one() {
     local t_func="$1" r_truth="$2" drop_ws="$3" set_gen="$4"
-    local name="${CAT}_dropfunc${LEG_TAG}_truth_${t_func}_r${r_truth}"
-    local cmd_gen="combine $WS -M GenerateOnly -m 125 -t $NTOYS -s $SEED -n .gen_${name} --expectSignal ${r_truth} --setParameters ${set_gen} --freezeParameters ${FREEZE_GEN} --cminDefaultMinimizerStrategy 0 --rMin $RMIN --rMax $RMAX --saveToys"
-    local cmd_fit="combine -M FitDiagnostics $drop_ws -m 125 -t $NTOYS -s $SEED -n .fit_${name} --expectSignal ${r_truth} --toysFile higgsCombine.gen_${name}.GenerateOnly.mH125.${SEED}.root --freezeParameters ${FREEZE_FIT} --cminDefaultMinimizerStrategy 0 --robustFit 1 --rMin $RMIN --rMax $RMAX $STABILITY_FLAGS"
-    local cmd_plot="python3 $SCRIPT_DIR/plot_bias_pull_FitDiagnostics.py -i fitDiagnostics.fit_${name}.root --r-truth ${r_truth} --truth-func ${t_func} --fit-func envelope_minus_${t_func} --cat ${name} -o $OUTDIR"
+    local name="${CAT}_dropfunc${LEG_TAG}_truth_${t_func}_r${r_truth}${NAME_TAG}"
+    local rmin rmax; read -r rmin rmax <<< "$(r_window "$r_truth")"
+    local cmd_gen="combine $WS -M GenerateOnly -m 125 -t $NTOYS -s $SEED -n .gen_${name} --expectSignal ${r_truth} --setParameters ${set_gen} --freezeParameters ${FREEZE_GEN} --cminDefaultMinimizerStrategy 0 --rMin $rmin --rMax $rmax --saveToys"
+    local cmd_fit="combine -M FitDiagnostics $drop_ws -m 125 -t $NTOYS -s $SEED -n .fit_${name} --expectSignal ${r_truth} --toysFile higgsCombine.gen_${name}.GenerateOnly.mH125.${SEED}.root --freezeParameters ${FREEZE_FIT} --cminDefaultMinimizerStrategy 0 --robustFit 1 --rMin $rmin --rMax $rmax $STABILITY_FLAGS"
+    local cmd_plot="python3 $SCRIPT_DIR/plot_bias_pull_FitDiagnostics.py -i fitDiagnostics.fit_${name}.root --r-truth ${r_truth} --truth-func ${t_func} --fit-func envelope_minus_${t_func} --cat ${name} -o $OUTDIR$(plot_range_args "$r_truth")"
 
     echo "-------------------------------------------------------------------------"
-    echo "   [dropfunc] $CAT ($LEG leg) | Truth [${t_func^^}] absent from fit envelope | r=${r_truth}"
+    echo "   [dropfunc] $CAT ($LEG leg) | Truth [${t_func^^}] absent from fit envelope | r=${r_truth} | r range [${rmin}, ${rmax}]"
     echo "-------------------------------------------------------------------------"
     echo "  [GEN]  $cmd_gen"
     echo "  [FIT]  $cmd_fit"
@@ -342,9 +389,9 @@ else
         mkdir -p "$OUTDIR"
         for t_func in "${VALID_TFUNCS[@]}"; do
             for r_truth in "${R_TRUTH_VALUES[@]}"; do
-                name="${CAT}_dropfunc${LEG_TAG}_truth_${t_func}_r${r_truth}"
+                name="${CAT}_dropfunc${LEG_TAG}_truth_${t_func}_r${r_truth}${NAME_TAG}"
                 if [ -f "fitDiagnostics.fit_${name}.root" ]; then
-                    python3 "$SCRIPT_DIR/plot_bias_pull_FitDiagnostics.py" -i "fitDiagnostics.fit_${name}.root" --r-truth "${r_truth}" --truth-func "${t_func}" --fit-func "envelope_minus_${t_func}" --cat "${name}" -o "$OUTDIR"
+                    python3 "$SCRIPT_DIR/plot_bias_pull_FitDiagnostics.py" -i "fitDiagnostics.fit_${name}.root" --r-truth "${r_truth}" --truth-func "${t_func}" --fit-func "envelope_minus_${t_func}" --cat "${name}" -o "$OUTDIR" $(plot_range_args "$r_truth")
                 else
                     echo "[SKIP] ${name}: no fitDiagnostics output (see combine_fit_${name}.log)"
                 fi
@@ -354,7 +401,7 @@ else
 fi
 
 if [ "$DO_RUN" = true ] && [ "$PUBLISH" = true ]; then
-    PUB_DIR="$HOME/public_html/BiasSensitivityStudies_v7_final_dropfunc_${CAT}${LEG_TAG}_rMin${RMIN}rMax${RMAX}_${NTOYS}toys"
+    PUB_DIR="$HOME/public_html/BiasSensitivityStudies_v7_final_dropfunc_${CAT}${LEG_TAG}_${RANGE_TAG}_${NTOYS}toys"
     mkdir -p "$PUB_DIR/StandardStudies_dropfunc"
     cp "$OUTDIR"/*.png "$PUB_DIR/StandardStudies_dropfunc/" 2>/dev/null
     cp "$OUTDIR"/pull_summary.json "$PUB_DIR/StandardStudies_dropfunc/" 2>/dev/null

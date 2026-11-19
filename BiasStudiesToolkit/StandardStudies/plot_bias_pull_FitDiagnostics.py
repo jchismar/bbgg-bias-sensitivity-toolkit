@@ -21,7 +21,18 @@ parser.add_argument('-o', '--outdir', default='./bias_plots', help='Output direc
 parser.add_argument('--r-min', type=float, default=None, help='rMin used in the fit, to drop toys pinned at the boundary')
 parser.add_argument('--r-max', type=float, default=None, help='rMax used in the fit, to drop toys pinned at the boundary')
 parser.add_argument('--boundary-eps', type=float, default=1e-3, help='How close to rMin/rMax counts as pinned-at-boundary')
+parser.add_argument('--fixed-pull', type=float, default=None, metavar='P',
+                    help='Also compute a median pull in which bad toys are counted with a fixed pull instead of '
+                         'dropped (same rules as submitBiasTests.py --failedFitR -P --keepEdgeFits P '
+                         '--keepLopsidedFits P --clipOutlierPulls): failed fits (fit_status<0) = -P; converged at '
+                         'rMin/rMax with no usable error = -P/+P; lopsided errors clipped by the rMin/rMax boundary '
+                         '= -P/+P; |pull|>=5 = +-P. These only enter median_pull_fixed (and n_in_median_fixed), '
+                         'never the histogram or Gaussian fit. Needs --r-min and --r-max.')
 args = parser.parse_args()
+if args.fixed_pull is not None:
+    if args.r_min is None or args.r_max is None:
+        parser.error('--fixed-pull needs --r-min and --r-max (the fit range) to classify edge fits')
+    args.fixed_pull = abs(args.fixed_pull)
 
 os.makedirs(args.outdir, exist_ok=True)
 
@@ -77,6 +88,69 @@ if args.r_max is not None:
 
 t.Draw(todraw, base_cut, "goff")
 
+
+def fixed_pull_median(tree, rin, rmin, rmax, P):
+    """Median pull with bad toys counted at a fixed pull, classified exactly as
+    submitBiasTests.py's readPulls() does. Good fits (usable error, |pull|<5)
+    enter with their own pull; the fixed ones only enter this median."""
+    tol = 1e-3 * (rmax - rmin)
+    good, fixed = [], []
+    n = {"n_failed": 0, "n_edge_noerr": 0, "n_lopsided_near_edge": 0, "n_pull_out5": 0, "n_other_dropped": 0,
+         "n_at_rmin": 0, "n_at_rmax": 0}
+    for i in range(tree.GetEntries()):
+        tree.GetEntry(i)
+        r, lo, hi, sym = tree.r, tree.rLoErr, tree.rHiErr, tree.rErr
+        if tree.fit_status < 0:
+            n["n_failed"] += 1
+            fixed.append(-P)
+            continue
+        at_min, at_max = r <= rmin + tol, r >= rmax - tol
+        n["n_at_rmin"] += at_min
+        n["n_at_rmax"] += (at_max and not at_min)
+        # error on the side facing r_in; symmetric error if missing or > 3x lopsided
+        lopsided = lo > 0 and hi > 0 and (lo / hi > 3.0 or hi / lo > 3.0)
+        err = sym if (lo <= 0 or hi <= 0 or lopsided) else (lo if r > rin else hi)
+        if err > 0:
+            pull = (r - rin) / err
+            if abs(pull) < 5:
+                good.append(pull)
+            else:
+                n["n_pull_out5"] += 1
+                fixed.append(P if pull > 0 else -P)
+        elif at_min or at_max:
+            n["n_edge_noerr"] += 1
+            fixed.append(-P if at_min else P)
+        elif lopsided:
+            miss = "lo" if lo < hi else "hi"
+            clipped = (r - lo <= rmin + tol) if miss == "lo" else (r + hi >= rmax - tol)
+            if clipped:
+                n["n_lopsided_near_edge"] += 1
+                fixed.append(-P if miss == "lo" else P)
+            else:
+                n["n_other_dropped"] += 1
+        else:
+            n["n_other_dropped"] += 1
+    allp = np.array(good + fixed)
+    res = {"fixed_pull": P, "n_good_fixed": len(good), "n_in_median_fixed": int(len(allp)), **n}
+    if len(allp):
+        sd = np.std(good, ddof=1) if len(good) > 1 else np.nan
+        res["median_pull_fixed"] = float(np.median(allp))
+        res["error_median_pull_fixed"] = float(np.sqrt(np.pi / 2.0) * sd / np.sqrt(len(allp)))
+    else:
+        res["median_pull_fixed"] = res["error_median_pull_fixed"] = float("nan")
+    return res
+
+
+fixed_res = None
+if args.fixed_pull is not None:
+    fixed_res = fixed_pull_median(t, r_in, args.r_min, args.r_max, args.fixed_pull)
+    print(f"--> Median pull with bad toys at fixed pull -/+{args.fixed_pull:g}: "
+          f"{fixed_res['median_pull_fixed']:+.3f} +- {fixed_res['error_median_pull_fixed']:.3f} "
+          f"(N={fixed_res['n_in_median_fixed']}/{t.GetEntries()}: good {fixed_res['n_good_fixed']}, "
+          f"failed {fixed_res['n_failed']}, edge {fixed_res['n_edge_noerr']}, "
+          f"lopsided {fixed_res['n_lopsided_near_edge']}, |pull|>=5 {fixed_res['n_pull_out5']}, "
+          f"dropped {fixed_res['n_other_dropped']}; at rMin/rMax {fixed_res['n_at_rmin']}/{fixed_res['n_at_rmax']})")
+
 canv = ROOT.TCanvas("c", "c", 800, 600)
 hist_pull.Draw("E")
 
@@ -100,7 +174,7 @@ fg.SetLineWidth(2)
 # reuses that cached window instead of re-deriving its own.
 import re
 core_range_cache_path = os.path.join(args.outdir, ".core_range_cache.json")
-core_range_key = re.sub(r'_r-?\d+$', '', args.cat) + f"|{args.truth_func}|{args.fit_func}"
+core_range_key = re.sub(r'_r-?[0-9.]+(?=(_rInjPm[0-9.]+)?$)', '', args.cat) + f"|{args.truth_func}|{args.fit_func}"
 try:
     with open(core_range_cache_path) as _fh:
         core_range_cache = json.load(_fh)
@@ -146,7 +220,7 @@ fg_full.SetLineWidth(2)
 fg_full.Draw("same")
 print(f"--> Core-fit range used: [{lo:.2f}, {hi:.2f}], chi2/ndf = {fg.GetChisquare():.1f}/{fg.GetNDF()}")
 
-outname = f"{args.outdir}/pull_{args.cat}_truth_{args.truth_func}_fit_{args.fit_func}_r{int(r_in)}.png"
+outname = f"{args.outdir}/pull_{args.cat}_truth_{args.truth_func}_fit_{args.fit_func}_r{r_in:g}.png"
 canv.SaveAs(outname)
 print(f"--> Saved pull plot: {outname}")
 
@@ -194,6 +268,9 @@ record = {
     "fit_mean": fit_mean,
     "fit_sigma": fit_sigma
 }
+if fixed_res is not None:
+    record.update(fixed_res)
+    record.update({"r_min": args.r_min, "r_max": args.r_max})
 
 if os.path.exists(summary_json):
     try:

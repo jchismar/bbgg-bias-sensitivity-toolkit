@@ -208,6 +208,14 @@ Reuses `plot_bias_pull_FitDiagnostics.py` for plotting, writing to
 `--rmin`/`--rmax`, `--only-hgg` flags as `run_envelope_bias.sh` — see
 `--help`.
 
+`--r-values`, `--r-expected X` (fit window `r_inj -/+ X`, default
+injections `0,X`) and `--fixed-pull P` (extra `median_pull_fixed` in
+`pull_summary.json` with failed/edge/lopsided/outlier toys counted at -/+P,
+same rules as `submitBiasTests.py --failedFitR -P --keepEdgeFits P
+--keepLopsidedFits P --clipOutlierPulls`) work as in the dropfunc check.
+`--parallel` runs every combination's GEN+FIT as a background job (plots
+afterward, sequentially); `--max-jobs N` caps how many run at once.
+
 ### 4. Fixed-vs-envelope significance (spurious signal)
 
 `RunBiasInSignificance.py` runs the classic combine discrete-profiling bias
@@ -387,6 +395,10 @@ Useful options: dry run without `--run` (still builds the reduced
 workspaces so you can inspect them), `--parallel` (all GEN+FIT jobs at
 once; plotting stays sequential because all entries go to the same JSON),
 `--truth-funcs` / `--r-values` (fill in missing combinations),
+`--r-expected X` (fit each injection in the window `[r_inj - X, r_inj + X]`
+instead of `--rmin/--rmax`, default injections become `0,X`; outputs get an
+`_rInjPmX` suffix so they never mix with fixed-range runs),
+`--fixed-pull P` (extra `median_pull_fixed` with bad toys at -/+P, see section 3),
 `--publish` (copies plots + JSON to
 `~/public_html/BiasSensitivityStudies_v7_final_dropfunc_<cat>_rMin<X>rMax<Y>_<N>toys/StandardStudies_dropfunc/`).
 `--stability-flags` is off by default because

@@ -73,6 +73,9 @@ show_help() {
     echo "  --fit-mode        'envelope' (default): fit with the full envelope floating everywhere."
     echo "                    'wrongfit': freeze ONLY cat J's pdfindex to a function != truth, envelope floats everywhere else."
     echo "  --run             Actually execute combine; otherwise dry-run (prints commands only)"
+    echo "  --parallel        Run every (truth x fit x r) combination's GEN+FIT as a background job instead of one at"
+    echo "                    a time; plotting runs afterward, sequentially (all plots append to one pull_summary.json)"
+    echo "  --max-jobs <N>    With --parallel: at most N combinations running at once (default 0 = all at once)"
     echo "  --only-hgg        Ignore an HBB leg on this category, if present"
     echo "  --ntoys           Toys per combine call (default 1000)"
     echo "  --seed            combine -s seed (default 123456)"
@@ -85,12 +88,24 @@ show_help() {
     echo "                         i.e. the output of RunBiasInSignificance.py --mode setup)"
     echo "  --bestfit-cache <file> Cached best-fit pdfindex bash snippet (default: \$SCRIPT_DIR/bestfit_pdfindices.sh);"
     echo "                         computed once from --bestfit-ws via get_bestfit_pdfindices.py and reused after that"
+    echo "  --r-values <list>      Comma-separated r_truth values to run (default: 0,2; 0,X with --r-expected X)"
+    echo "  --r-expected <X>       Per-injection POI window: each combination is generated + fit with"
+    echo "                         --rMin r_inj-X --rMax r_inj+X instead of --rmin/--rmax (which are then ignored)."
+    echo "                         Default --r-values become 0,X. Typically X = the expected upper limit on r."
+    echo "                         Outputs get an _rInjPm<X> suffix."
+    echo "  --fixed-pull <P>       Also report median_pull_fixed in pull_summary.json: bad toys counted at a fixed pull"
+    echo "                         instead of dropped, like submitBiasTests.py --failedFitR -P --keepEdgeFits P"
+    echo "                         --keepLopsidedFits P --clipOutlierPulls (failed = -P, at/near rMin = -P, at/near"
+    echo "                         rMax = +P, |pull|>=5 = +-P). Median only; histogram and Gaussian fit unchanged."
+    echo "                         Plots go to bias_plots_full_<cat>_<mode>..._fixedPull<P>/ (fit outputs are shared)."
     exit 0
 }
 
-WS=""; CAT=""; FIT_MODE="envelope"; DO_RUN=false; ONLY_HGG=false
+WS=""; CAT=""; FIT_MODE="envelope"; DO_RUN=false; ONLY_HGG=false; PARALLEL=false; MAX_JOBS=0
+PAR_NAMES=(); PAR_PLOTS=()
 NTOYS=1000; SEED=123456; RMIN=-5; RMAX=5; STABILITY=false
 BESTFIT_WS=""; BESTFIT_CACHE=""
+R_VALUES_ARG=""; R_EXPECTED=""; FIXED_PULL=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -105,8 +120,13 @@ while [[ $# -gt 0 ]]; do
         --rmin) RMIN="$2"; shift 2 ;;
         --rmax) RMAX="$2"; shift 2 ;;
         --stability-flags) STABILITY=true; shift ;;
+        --parallel) PARALLEL=true; shift ;;
+        --max-jobs) MAX_JOBS="$2"; shift 2 ;;
         --bestfit-ws) BESTFIT_WS="$2"; shift 2 ;;
         --bestfit-cache) BESTFIT_CACHE="$2"; shift 2 ;;
+        --r-values) R_VALUES_ARG="$2"; shift 2 ;;
+        --r-expected) R_EXPECTED="$2"; shift 2 ;;
+        --fixed-pull) FIXED_PULL="$2"; shift 2 ;;
         *) echo "[ERROR] Unknown option: $1"; show_help ;;
     esac
 done
@@ -121,7 +141,38 @@ fi
 CAT_NUM="${CAT#cat}"
 TRUTH_FUNCTIONS=("exp1" "bern1" "bern2" "bern3" "pow1" "lau1" "lau2")
 FIT_FUNCTIONS=("exp1" "bern1" "bern2" "bern3" "pow1" "lau1" "lau2")
-R_TRUTH_VALUES=(0 2)
+[[ "$MAX_JOBS" =~ ^[0-9]+$ ]] || { echo "[ERROR] --max-jobs must be a non-negative integer, got '$MAX_JOBS'"; exit 1; }
+for _opt in R_EXPECTED FIXED_PULL; do
+    if [ -n "${!_opt}" ]; then
+        awk -v x="${!_opt}" 'BEGIN{exit !(x+0 > 0)}' || { echo "[ERROR] --$(echo $_opt | tr 'A-Z_' 'a-z-') must be a positive number, got '${!_opt}'"; exit 1; }
+    fi
+done
+if [ -n "$R_VALUES_ARG" ]; then
+    IFS=',' read -r -a R_TRUTH_VALUES <<< "$R_VALUES_ARG"
+elif [ -n "$R_EXPECTED" ]; then
+    R_TRUTH_VALUES=(0 "$R_EXPECTED")
+else
+    R_TRUTH_VALUES=(0 2)
+fi
+
+# POI window for one injected r: [r_inj - R_EXPECTED, r_inj + R_EXPECTED] with
+# --r-expected, else the global --rmin/--rmax. Prints "<rmin> <rmax>".
+r_window() {
+    if [ -n "$R_EXPECTED" ]; then
+        awk -v r="$1" -v x="$R_EXPECTED" 'BEGIN{printf "%g %g\n", r - x, r + x}'
+    else
+        echo "$RMIN $RMAX"
+    fi
+}
+# Extra plotting args: the fit window (boundary cut + fixed-pull edge
+# classification) and --fixed-pull. Nothing without either option, so the
+# default behaviour is unchanged.
+plot_range_args() {
+    [ -z "$R_EXPECTED" ] && [ -z "$FIXED_PULL" ] && return 0
+    local lo hi; read -r lo hi <<< "$(r_window "$1")"
+    echo " --r-min $lo --r-max $hi${FIXED_PULL:+ --fixed-pull $FIXED_PULL}"
+}
+NAME_TAG="${R_EXPECTED:+_rInjPm${R_EXPECTED}}"
 
 echo "=== Resolving pdfindex legs and function map for $CAT (mode: $FIT_MODE) ==="
 eval "$(python3 "$SCRIPT_DIR/resolve_pdfindex_legs.py" "$WS" "$CAT_NUM")"
@@ -199,7 +250,7 @@ if [ "$DO_RUN" = false ]; then
     echo "DRY-RUN MODE: only printing commands. Add --run to execute."
 fi
 
-OUTDIR="./bias_plots_full_${CAT}_${FIT_MODE}"
+OUTDIR="./bias_plots_full_${CAT}_${FIT_MODE}${NAME_TAG}${FIXED_PULL:+_fixedPull${FIXED_PULL}}"
 
 for t_func in "${TRUTH_FUNCTIONS[@]}"; do
     if [ "$FIT_MODE" == "envelope" ]; then
@@ -239,20 +290,33 @@ for t_func in "${TRUTH_FUNCTIONS[@]}"; do
 
             SET_GEN="${SET_GEN:+$SET_GEN,}${OTHER_SET}"
 
-            NAME="${CAT}_full_${FIT_MODE}_truth_${t_func}_fit_${f_func}_r${r_truth}"
+            NAME="${CAT}_full_${FIT_MODE}_truth_${t_func}_fit_${f_func}_r${r_truth}${NAME_TAG}"
+            read -r R_LO R_HI <<< "$(r_window "$r_truth")"
             echo "-------------------------------------------------------------------------"
-            echo "   [full-${FIT_MODE}] $CAT | Truth [${t_func^^}] vs Fit [${f_func^^}] | r=${r_truth}"
+            echo "   [full-${FIT_MODE}] $CAT | Truth [${t_func^^}] vs Fit [${f_func^^}] | r=${r_truth} | r range [${R_LO}, ${R_HI}]"
             echo "-------------------------------------------------------------------------"
 
-            CMD_GEN="combine $WS -M GenerateOnly -m 125 -t $NTOYS -s $SEED -n .gen_${NAME} --expectSignal ${r_truth} --setParameters ${SET_GEN} --freezeParameters ${FREEZE_GEN} --cminDefaultMinimizerStrategy 0 --rMin $RMIN --rMax $RMAX --saveToys"
-            CMD_FIT="combine -M FitDiagnostics $WS -m 125 -t $NTOYS -s $SEED -n .fit_${NAME} --expectSignal ${r_truth} --toysFile higgsCombine.gen_${NAME}.GenerateOnly.mH125.${SEED}.root ${SET_FIT:+--setParameters ${SET_FIT}} --freezeParameters ${FREEZE_FIT} --cminDefaultMinimizerStrategy 0 --robustFit 1 --rMin $RMIN --rMax $RMAX $STABILITY_FLAGS"
-            CMD_PLOT="python3 $SCRIPT_DIR/plot_bias_pull_FitDiagnostics.py -i fitDiagnostics.fit_${NAME}.root --r-truth ${r_truth} --truth-func ${t_func} --fit-func ${f_func} --cat ${NAME} -o $OUTDIR"
+            CMD_GEN="combine $WS -M GenerateOnly -m 125 -t $NTOYS -s $SEED -n .gen_${NAME} --expectSignal ${r_truth} --setParameters ${SET_GEN} --freezeParameters ${FREEZE_GEN} --cminDefaultMinimizerStrategy 0 --rMin $R_LO --rMax $R_HI --saveToys"
+            CMD_FIT="combine -M FitDiagnostics $WS -m 125 -t $NTOYS -s $SEED -n .fit_${NAME} --expectSignal ${r_truth} --toysFile higgsCombine.gen_${NAME}.GenerateOnly.mH125.${SEED}.root ${SET_FIT:+--setParameters ${SET_FIT}} --freezeParameters ${FREEZE_FIT} --cminDefaultMinimizerStrategy 0 --robustFit 1 --rMin $R_LO --rMax $R_HI $STABILITY_FLAGS"
+            CMD_PLOT="python3 $SCRIPT_DIR/plot_bias_pull_FitDiagnostics.py -i fitDiagnostics.fit_${NAME}.root --r-truth ${r_truth} --truth-func ${t_func} --fit-func ${f_func} --cat ${NAME} -o $OUTDIR$(plot_range_args "$r_truth")"
 
             echo "  [GEN]  $CMD_GEN"
             echo "  [FIT]  $CMD_FIT"
             echo "  [PLOT] $CMD_PLOT"
 
-            if [ "$DO_RUN" = true ]; then
+            if [ "$DO_RUN" = true ] && [ "$PARALLEL" = true ]; then
+                # Throttle to --max-jobs (0 = no limit), then launch GEN+FIT
+                # in the background; plotting is deferred (shared JSON).
+                if [ "$MAX_JOBS" -gt 0 ]; then
+                    while [ "$(jobs -rp | wc -l)" -ge "$MAX_JOBS" ]; do wait -n; done
+                fi
+                (
+                    eval $CMD_GEN > combine_gen_${NAME}.log 2>&1 || { echo "[ERROR] Generation failed for ${NAME}. See combine_gen_${NAME}.log"; exit 1; }
+                    eval $CMD_FIT > combine_fit_${NAME}.log 2>&1 || { echo "[ERROR] Fit failed for ${NAME}. See combine_fit_${NAME}.log"; exit 1; }
+                    echo "[DONE] ${NAME}"
+                ) &
+                PAR_NAMES+=("$NAME"); PAR_PLOTS+=("$CMD_PLOT")
+            elif [ "$DO_RUN" = true ]; then
                 eval $CMD_GEN > combine_gen_${NAME}.log 2>&1
                 if [ $? -ne 0 ]; then echo "[ERROR] Generation failed for ${NAME}. See combine_gen_${NAME}.log"; continue; fi
                 eval $CMD_FIT > combine_fit_${NAME}.log 2>&1
@@ -266,3 +330,17 @@ for t_func in "${TRUTH_FUNCTIONS[@]}"; do
         done
     done
 done
+
+if [ "$DO_RUN" = true ] && [ "$PARALLEL" = true ]; then
+    echo "=== [parallel] ${#PAR_NAMES[@]} GEN+FIT jobs launched (max at once: ${MAX_JOBS/#0/unlimited}); waiting ==="
+    wait
+    echo "=== [parallel] all GEN+FIT jobs finished -- plotting sequentially ==="
+    mkdir -p "$OUTDIR"
+    for i in "${!PAR_NAMES[@]}"; do
+        if [ -f "fitDiagnostics.fit_${PAR_NAMES[$i]}.root" ]; then
+            eval ${PAR_PLOTS[$i]}
+        else
+            echo "[SKIP] ${PAR_NAMES[$i]}: no fitDiagnostics output (see combine_gen/fit_${PAR_NAMES[$i]}.log)"
+        fi
+    done
+fi

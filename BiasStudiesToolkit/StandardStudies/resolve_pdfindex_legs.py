@@ -96,7 +96,7 @@ def main():
             if tag == "unknown":
                 continue
             mpdf_lower = mpdf_name.lower()
-            if token not in mpdf_lower:
+            if token.lower() not in mpdf_lower:
                 continue
             if multi_leg and leg_kw not in mpdf_lower:
                 continue
