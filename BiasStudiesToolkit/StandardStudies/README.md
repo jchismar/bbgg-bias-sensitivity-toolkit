@@ -46,6 +46,60 @@ background is a `RooMultiPdf` with a `pdfindex_*` discrete nuisance.
    what freezing it or a Gaussian would give, that's the classic "spurious
    signal from discrete profiling" bias.
 
+## Changes for resonant HH (X → HH)
+
+These changes were made to run the checks on the **resonant X → HH → bbγγ**
+datacards; they were first used on the M900_v4 resolved card. Each one is
+tagged **[resonant HH]** where it appears below. All new options are off by
+default, so without them every script behaves exactly as before. The M900_v4
+study itself is written up in [`M900_v4_res_bias_checks.md`](M900_v4_res_bias_checks.md).
+
+Why they were needed: at high X mass the resolved categories have very little
+background under the m_γγ peak. With the original fixed `--rMin -5 --rMax 5`
+many background-only toys fail or end at the lower edge of the fit range, and
+some categories' s+b pdf goes negative at small negative r (−0.55 for
+cat0Resolved at M900). The new options make the fit range, the treatment of
+those toys and the summary number match the existing resonant bias study,
+`flashggFinalFit/submitBiasTests.py`.
+
+**Fixes for these cards**
+- `resolve_pdfindex_legs.py`, `build_dropfunc_workspace.py`: the category
+  token (e.g. `cat2Resolved`) was compared against lower-cased pdf names, so
+  bin names with capital letters never matched. Now case-insensitive.
+- `run_dropfunc_envelope_bias.sh`: accepts absolute paths on `shapes` lines.
+
+**New options** (in `run_dropfunc_envelope_bias.sh` and `run_full_envelope_bias.sh`)
+- `--r-expected X`: fit each injected r in `[r_inj − X, r_inj + X]` instead
+  of `--rmin/--rmax`; default injections become `0,X`. X is meant to be the
+  median expected limit, as in `submitBiasTests.py --expRange 1`. Outputs get
+  an `_rInjPmX` suffix.
+- `--fixed-pull P`: also reports `median_pull_fixed`, the median pull with
+  failed, edge, lopsided and |pull| ≥ 5 toys counted at ∓P instead of dropped.
+  Same rules as `submitBiasTests.py --failedFitR -P --keepEdgeFits P
+  --keepLopsidedFits P --clipOutlierPulls`, and it reproduces that script's
+  medians exactly. Plots go to a `…_fixedPullP` folder.
+- `--r-min-floor auto|R`: never let rMin go below the floor (and never above
+  r_inj), as `submitBiasTests.py --rMinFloor`. `auto` = 0.9 × the least
+  negative r at which some category's s+b density reaches zero. Outputs get
+  a `_rMinPos` (`_rMinFloorR`) suffix.
+- `run_full_envelope_bias.sh` only: `--r-values`, `--parallel` /
+  `--max-jobs N`, and `--fit-mode samefit` (the fit = truth diagonal that
+  `wrongfit` skips).
+
+**Plotting** (`plot_bias_pull_FitDiagnostics.py`)
+- `--fixed-pull P` (with `--r-min/--r-max`) computes `median_pull_fixed`.
+- The r = 0 core-fit window is now also reused for non-integer injected r
+  (e.g. r_exp = 2.3672), and plot names keep the decimal (`_r2.3672.png`).
+
+**New helper scripts**
+- `zero_density_r.py <ws.root>`: the rMin floor used by `--r-min-floor auto`
+  (port of `submitBiasTests.py`'s `zeroDensityR()`).
+- `make_median_tables.py`: truth × fit tables of `median_pull_fixed` for the
+  full-envelope (envelope / wrongfit / samefit) and dropfunc runs, as Markdown
+  plus one PNG per category and r, labelled with each category's best-fit function.
+- `organize_plots_by_r.py <run_dir>`: moves each `bias_plots_*` folder's
+  plots into one `r<value>/` subfolder per injected r.
+
 ## Step-by-step (new datacard, 1D or 2D)
 
 ```bash
@@ -174,6 +228,10 @@ text2workspace.py Datacard_newAnalysis.txt -m 125 -o Datacard_newAnalysis.root
 # Freeze ONLY cat2 to a wrong function (k != truth i), envelope floats elsewhere:
 ./run_full_envelope_bias.sh --ws Datacard_newAnalysis.root --cat cat2 --fit-mode wrongfit
 
+# [resonant HH] Freeze ONLY cat2 to the truth function itself (k == i), the
+# diagonal wrongfit skips; envelope floats elsewhere:
+./run_full_envelope_bias.sh --ws Datacard_newAnalysis.root --cat cat2 --fit-mode samefit
+
 # Dry-run by default (prints the combine commands); add --run to execute:
 ./run_full_envelope_bias.sh --ws Datacard_newAnalysis.root --cat cat2 --fit-mode envelope --run
 ```
@@ -208,13 +266,16 @@ Reuses `plot_bias_pull_FitDiagnostics.py` for plotting, writing to
 `--rmin`/`--rmax`, `--only-hgg` flags as `run_envelope_bias.sh` — see
 `--help`.
 
-`--r-values`, `--r-expected X` (fit window `r_inj -/+ X`, default
-injections `0,X`) and `--fixed-pull P` (extra `median_pull_fixed` in
+**[resonant HH]** `--r-values`, `--r-expected X` (fit window `r_inj -/+ X`,
+default injections `0,X`), `--fixed-pull P` (extra `median_pull_fixed` in
 `pull_summary.json` with failed/edge/lopsided/outlier toys counted at -/+P,
 same rules as `submitBiasTests.py --failedFitR -P --keepEdgeFits P
---keepLopsidedFits P --clipOutlierPulls`) work as in the dropfunc check.
-`--parallel` runs every combination's GEN+FIT as a background job (plots
-afterward, sequentially); `--max-jobs N` caps how many run at once.
+--keepLopsidedFits P --clipOutlierPulls`) and `--r-min-floor auto|R` work as
+in the dropfunc check. `--parallel` runs every combination's GEN+FIT as a
+background job (plots afterward, sequentially); `--max-jobs N` caps how many
+run at once. `--fit-mode samefit` uses the same generation and seed as the
+other modes, so its toys are identical and the three modes fill one
+truth × fit table (see `make_median_tables.py`).
 
 ### 4. Fixed-vs-envelope significance (spurious signal)
 
@@ -395,10 +456,12 @@ Useful options: dry run without `--run` (still builds the reduced
 workspaces so you can inspect them), `--parallel` (all GEN+FIT jobs at
 once; plotting stays sequential because all entries go to the same JSON),
 `--truth-funcs` / `--r-values` (fill in missing combinations),
-`--r-expected X` (fit each injection in the window `[r_inj - X, r_inj + X]`
-instead of `--rmin/--rmax`, default injections become `0,X`; outputs get an
-`_rInjPmX` suffix so they never mix with fixed-range runs),
-`--fixed-pull P` (extra `median_pull_fixed` with bad toys at -/+P, see section 3),
+**[resonant HH]** `--r-expected X` (fit each injection in the window
+`[r_inj - X, r_inj + X]` instead of `--rmin/--rmax`, default injections become
+`0,X`; outputs get an `_rInjPmX` suffix so they never mix with fixed-range runs),
+**[resonant HH]** `--fixed-pull P` (extra `median_pull_fixed` with bad toys at
+-/+P, see section 3), **[resonant HH]** `--r-min-floor auto|R` (rMin never below
+the floor where the s+b pdf stays positive, `_rMinPos` suffix),
 `--publish` (copies plots + JSON to
 `~/public_html/BiasSensitivityStudies_v7_final_dropfunc_<cat>_rMin<X>rMax<Y>_<N>toys/StandardStudies_dropfunc/`).
 `--stability-flags` is off by default because
